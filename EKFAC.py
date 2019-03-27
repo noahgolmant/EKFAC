@@ -1,17 +1,32 @@
 import torch
 import warnings
 
-class EKFAC(torch.optim.Optimizer):
+
+# We know how to compute kronecker factors for these ones!
+VALID_MODULES = (
+    torch.nn.Bilinear,
+    torch.nn.Conv1d,
+    torch.nn.Conv2d,
+    torch.nn.Conv3d,
+    torch.nn.ConvTranspose1d,
+    torch.nn.ConvTranspose2d,
+    torch.nn.ConvTranspose3d,
+    torch.nn.Linear
+)
+
+
+class EKFAC(torch.optim.optimizers.SGD):
     """ Implements the Eigenvalue-corrected Kronecker-factored Optimized Curvature preconditioner
 
     See details at https://arxiv.org/pdf/1806.03884.pdf"""
 
     def __init__(self,
                  network,
-                 recompute_KFAC_steps=1,
-                 running_average=True,
-                 alpha=0.75
-                 epsilon=0.1):
+                 update_freq=1,
+                 eps=0.1,
+                 running_avg=True,
+                 alpha=0.75,
+                 **kwargs):
 
         """
         Arguments:
@@ -22,33 +37,23 @@ class EKFAC(torch.optim.Optimizer):
             running_average (bool) - if True, will keep a running average of the diagonal elements of the 
                                      scaling matrix (the approximate eigenvalues) rather than recomputing 
                                      from scratch for each iteration"""
+        super(EKFAC, self).__init__(self, parameters=network.parameters(),
+                                    **kwargs)
 
-        self.epsilon = epsilon
-        self.running_average = running_average
+        self.eps = eps
+        self.running_avg = running_avg
         if self.running_average:
             self.alpha = alpha
-
-        self.params_by_layer = []
-
-        self.modules_with_weights = [torch.nn.Bilinear,
-                        torch.nn.Conv1d,
-                        torch.nn.Conv2d,
-                        torch.nn.Conv3d,
-                        torch.nn.ConvTranspose1d,
-                        torch.nn.ConvTranspose2d,
-                        torch.nn.ConvTranspose3d,
-                        torch.nn.Linear,
-                       ]
 
         self.stored_items = {}
 
         # need to keep track of iteration because we only recompute KFAC matrices every 'self.recompute_KFAC_steps' steps
-        self.iteration_number = 0
-        self.recompute_KFAC_steps = recompute_KFAC_steps
+        self.iteration = 0
+        self.update_freq = update_freq
 
         tracked_modules_count = 0
         for layer in network.modules():
-            if type(layer) in self.modules_with_weights:
+            if type(layer) in VALID_MODULES:
                 if type(layer) != torch.nn.Linear:
                     warnings.warn('Have not tested this for any module type other than linear')
 
@@ -63,21 +68,26 @@ class EKFAC(torch.optim.Optimizer):
 
                 # make a label for the module and add it to the keys of the stored_items dictionary
                 tracked_modules_count += 1
-
                 self.stored_items[layer] = {}
 
-        default_options = {}
-        super(EKFAC, self).__init__(self.params_by_layer, default_options)
+        defaults = dict(
+             update_freq=update_freq,
+             eps=eps,
+             running_avg=running_avg,
+             alpha=alpha,
+             **kwargs
+        )
+        super(EKFAC, self).__init__(self.params_by_layer, defaults)
 
     def step(self):
-
-        if self.iteration_number % self.recompute_KFAC_steps == 0:
+        if self.iteration % self.update_freq == 0:
             self.compute_Kronecker_matrices()
 
         self.compute_scalings()
-#         self.precondition()
+        self.precondition()
+        super(EKFAC, self).step()
 
-        self.iteration_number += 1
+        self.iteration += 1
 
     def store_input(self, module, inputs_to_module):
         """ When called before running each layer with weights, this function stores
